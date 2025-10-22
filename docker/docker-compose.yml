@@ -1,0 +1,37 @@
+version: '3.8'  
+  
+services:  
+  rl2-learning:  
+    build:  
+      context: .   # 指定路径
+      dockerfile: Dockerfile   # 基于此文件进行镜像创建
+    image: rl2-learning:latest  
+    container_name: rl2-learning  
+      
+    # GPU 支持  
+    deploy:  
+      resources:  
+        reservations:  
+          devices:  
+            - driver: nvidia  
+              count: 1  
+              capabilities: [gpu]  
+      
+    # 挂载本地代码和数据   rl2outputs
+    volumes:  
+      - /home/nvidia/Desktop/RL2:/workspace/RL2  # 源码目录  
+      - /home/nvidia/Desktop/localdatasets:/workspace/localdatasets  
+      - /home/nvidia/Desktop/dpanel-datas/rl2outputs:/workspace/rl2outputs  
+      - /home/nvidia/Desktop/dpanel-datas/rl2datas:/workspace/rl2datas  
+      - ~/Desktop/localmodels:/root/localmodels
+      - ~/.cache/huggingface:/root/.cache/huggingface  
+      
+    # 保持容器运行  
+    stdin_open: true  
+    tty: true  
+      
+    # 工作目录  
+    working_dir: /workspace/RL2  
+      
+    # 网络模式  
+    network_mode: host

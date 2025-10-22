@@ -4,8 +4,10 @@ import torch
 import torch.distributed as dist
 
 def initialize_global_process_group(timeout_second=36000):
-    
-    dist.init_process_group("nccl", timeout=timedelta(seconds=timeout_second))
+    # 单卡模式使用 gloo 后端,避免 NCCL 网络配置问题   × 错误的设置
+
+    # dist.init_process_group("gloo", timeout=timedelta(seconds=timeout_second)) # 单卡，使用 gloo backend
+    dist.init_process_group("nccl", timeout=timedelta(seconds=timeout_second)) # original 多卡通信
     local_rank = int(os.environ["LOCAL_RANK"])
     torch.cuda.set_device(local_rank)
 

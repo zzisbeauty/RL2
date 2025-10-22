@@ -2,9 +2,19 @@
 __pycache__/
 *.py[cod]
 *$py.class
+rl_square.egg-info
+
+.vscode
+.idea
+.pycharm
+
+
 
 # C extensions
 *.so
+
+
+
 
 # Distribution / packaging
 .Python
@@ -107,7 +117,7 @@ venv.bak/
 dmypy.json
 
 # VS Code
-.vscode/
+# .vscode/
 *.code-workspace
 
 # PyCharm

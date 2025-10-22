@@ -7,6 +7,18 @@ from RL2.workers import initialize_actor
 from RL2.utils.communication import initialize_global_process_group
 
 
+
+import os
+
+os.environ.setdefault("RANK", "0")
+os.environ.setdefault("LOCAL_RANK", "0")
+os.environ.setdefault("WORLD_SIZE", "1")
+os.environ.setdefault("MASTER_ADDR", "localhost")
+os.environ.setdefault("MASTER_PORT", "29501")
+
+
+
+
 class DPOTrainer(Trainer):
 
     def __init__(self, config):
@@ -44,6 +56,7 @@ class DPOTrainer(Trainer):
         self.save_model((self.actor,))
 
 
+# @hydra.main(config_path="/workspace/RL2/RL2/trainer/config", config_name="dpo", version_base=None)
 @hydra.main(config_path="config", config_name="dpo", version_base=None)
 def main(config):
 

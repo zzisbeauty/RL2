@@ -4,13 +4,11 @@ FROM nvidia/cuda:12.8.0-devel-ubuntu22.04
 # Set initial working directory
 WORKDIR /workspace
 
-RUN apt-get update && apt-get install -y git && rm -rf /var/lib/apt/lists/*
-
+# RUN apt-get update && apt-get install -y git && rm -rf /var/lib/apt/lists/*
 # Clone the repository
-RUN git clone https://github.com/ChenmienTan/RL2
-
-# Set the working directory to the cloned repo
-WORKDIR /workspace/RL2
+# RUN git clone https://github.com/ChenmienTan/RL2
+# # Set the working directory to the cloned repo
+# WORKDIR /workspace/RL2
 
 RUN apt-get update && apt-get install -y python3-pip vim && rm -rf /var/lib/apt/lists/*
 
