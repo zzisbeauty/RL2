@@ -25,7 +25,7 @@ Also check our wandb report on [OpenThoughts](https://wandb.ai/chenmientan/OpenT
 - [X] Support Megatron backend to increase GPU utilization for Mixture-of-Expert
 - [ ] Support Low-Rank Adaptation to decrease GPU memory comsumption
 - [X] Initialize model on meta device to decrease RAM consumption
-- [ ] Support partial rollout to decrease GPU idle
+- [X] Support partial rollout to decrease GPU idle
 - [X] Use SGLang Router to forward requests for load balance between inference engines
 - [X] Integrate GEM to scale environments
 
@@ -88,11 +88,14 @@ Multi-turn is only supported by the latter format.
 ```json
 [
     {
-        "messages": [
-            {"role": "user", "content": "What is the capital of China?"}
+        "chosen": [
+            {"role": "user", "content": "What is the capital of China?"},
+            {"role": "assistant", "content": "Beijing."}
         ],
-        "chosen": "Beijing.",
-        "rejected": "Shanghai."
+        "rejected": [
+            {"role": "user", "content": "What is the capital of China?"},
+            {"role": "assistant", "content": "Shanghai."}
+        ]
     }
 ]
 ```
@@ -192,7 +195,7 @@ The product of `ddp_size` and `tp_size` should be a factor of the total number o
 For SFT, RM, and DPO, `max_length` is used to truncate sequences.
 In RM and DPO, the chosen and rejected sequences will be packed together, so the actual sequence length can be up to twice of `max_length`.
 For PPO, `max_new_tokens` is used to terminate generations.
-The length of any sequence cannot exceed `sp_size * tp_size * max_length_per_device`.
+The length of any sequence cannot exceed `cp_size * tp_size * max_length_per_device`.
 
 ### Algorithm
 

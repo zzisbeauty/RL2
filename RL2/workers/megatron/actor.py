@@ -1,13 +1,14 @@
+from typing import Dict, Optional, Tuple, List
+from omegaconf import DictConfig
 from collections import defaultdict
 import torch
-import torch.nn.functional as F
 from megatron.core import parallel_state as mpu
 from RL2.workers.megatron import MegatronWorker
 from RL2.utils.sequences import count_total, gather_along_cp
 from RL2.utils.functions import (
     compute_logps_and_entropy, aggregate_values
 )
-from RL2.utils.algorithms import compute_approx_kl
+from RL2.utils.algorithms import dpo_loss, actor_ppo_loss
 from RL2.utils.logging import (
     time_logger,
     gather_and_log,
@@ -18,22 +19,35 @@ from RL2.utils.logging import (
 
 class MegatronActor(MegatronWorker):
     
-    def __init__(self, config, train: bool):
+    def __init__(self, config: DictConfig, train: bool):
         super().__init__(config, train)
-        # TODO: wrap_with_ddp=train?
-        self.model = self.bridge.get_model(wrap_with_ddp=True)
-        self.prepare_model_optimizer()
+
+        self.model = self.provider.provide_distributed_model(
+            ddp_config=self.ddp_config,
+            wrap_with_ddp=train
+        )
+        self._prepare_model_optimizer()
 
     @time_logger("compute_logps")
     @torch.no_grad()
-    def compute_logps(self, tensor_dict, step):
-        minibatches = self.scatter_data(tensor_dict)
-        self.load_model_to_gpu()
+    def compute_logps(
+        self,
+        tensor_dict: Optional[Dict[str, torch.Tensor]],
+        step: int,
+        pair: bool = False
+    ) -> Optional[Dict[str, torch.Tensor]]:
+        minibatches = self._scatter_data(tensor_dict, pair=pair)
+        self._load_model_to_gpu()
 
-        prefix = "old" if self.train else "ref"
+        prefix = "old_" if self.train else "ref_"
         for model in self.model:
             model.eval()
-        def f(minibatch, cu_seqlens, logits, non_loss_data=True):
+        def f(
+            minibatch: Dict[str, torch.Tensor],
+            cu_seqlens: torch.Tensor,
+            logits: torch.Tensor,
+            non_loss_data: bool = True
+        ) -> Dict[str, torch.Tensor]:
 
             compute_logps_and_entropy(
                 logits / getattr(self.config, "temperature", 1.0),
@@ -47,15 +61,19 @@ class MegatronActor(MegatronWorker):
                 cu_seqlens
             )
         
-        minibatches = self.forward_backward(f, minibatches)
+        minibatches = self._forward_backward(f, minibatches)
 
         if not self.train:
-            self.offload_model_to_cpu()
-        return self.gather_data(minibatches)
+            self._offload_model_to_cpu()
+        return self._gather_data(minibatches)
 
     @time_logger("update_actor")
-    def sft_update(self, tensor_dict, step):
-        minibatches = self.scatter_data(tensor_dict)
+    def sft_update(
+        self,
+        tensor_dict: Optional[Dict[str, torch.Tensor]],
+        step: int
+    ):
+        minibatches = self._scatter_data(tensor_dict)
 
         total_actions, total_sequences = count_total(
             minibatches,
@@ -63,7 +81,11 @@ class MegatronActor(MegatronWorker):
             mpu.get_data_parallel_group()
         )
 
-        def f(minibatch, cu_seqlens, logits):
+        def f(
+            minibatch: Dict[str, torch.Tensor],
+            cu_seqlens: torch.Tensor,
+            logits: torch.Tensor
+        ) -> Tuple[torch.Tensor, Dict[str, List[float]]]:
 
             compute_logps_and_entropy(
                 logits,
@@ -82,21 +104,29 @@ class MegatronActor(MegatronWorker):
                 total_actions,
                 total_sequences
             )
-            return self.scale_loss(loss), 1, {"loss": [loss.item()]}
+            return self._scale_loss(loss), {"loss": [loss.item()]}
 
-        metrics, grad_norm = self.forward_backward(f, minibatches)
+        metrics, grad_norm = self._forward_backward(f, minibatches)
         metrics["grad_norm"] = [grad_norm]
         gather_and_log(metrics, step, mpu.get_data_parallel_group())
 
     @time_logger("update_actor")
-    def dpo_update(self, tensor_dict, step):
-        minibatches = self.scatter_data(tensor_dict, pair=True)
+    def dpo_update(
+        self,
+        tensor_dict: Optional[Dict[str, torch.Tensor]],
+        step: int
+    ):
+        minibatches = self._scatter_data(tensor_dict, pair=True)
 
         total_pairs = count_total(
             minibatches, "eos_mask", mpu.get_data_parallel_group()
         ) // 2
 
-        def f(minibatch, cu_seqlens, logits):
+        def f(
+            minibatch: Dict[str, torch.Tensor],
+            cu_seqlens: torch.Tensor,
+            logits: torch.Tensor
+        ) -> Tuple[torch.Tensor, Dict[str, List[float]]]:
 
             compute_logps_and_entropy(
                 logits,
@@ -108,30 +138,25 @@ class MegatronActor(MegatronWorker):
                 mpu.get_context_parallel_group(),
                 cu_seqlens
             )
-            chosen_rewards, rejected_rewards = self.config.beta * (
-                minibatch["logps"] - minibatch["ref_logps"]
-            ).sum(-1).view(-1, 2).T
-            reward_margins = chosen_rewards - rejected_rewards
-            loss = - F.logsigmoid(reward_margins).sum() / total_pairs
-            metric = {
-                "rewards/chosen": chosen_rewards.tolist(),
-                "rewards/rejected": rejected_rewards.tolist(),
-                "rewards/margin": reward_margins.tolist(),
-                "loss": [loss.item()],
-                "accuracy": (reward_margins > 0).tolist()
-            }
-            return self.scale_loss(loss), 1, metric
+            losses, metric = dpo_loss(self.config, minibatch)
+            loss = losses.sum() / total_pairs
+            metric["loss"] = [loss.item()]
+            return self._scale_loss(loss), metric
 
-        metrics, grad_norm = self.forward_backward(f, minibatches)
+        metrics, grad_norm = self._forward_backward(f, minibatches)
         metrics["grad_norm"] = [grad_norm]
         gather_and_log(metrics, step, mpu.get_data_parallel_group())
 
     @time_logger("update_actor")
-    def ppo_update(self, tensor_dict, step):
+    def ppo_update(
+        self,
+        tensor_dict: Optional[Dict[str, torch.Tensor]],
+        step: int
+    ):
         if step < self.config.freeze_steps:
             return
-        batches = self.scatter_data(tensor_dict, pack_minibatches=True)
-        self.load_model_to_gpu()
+        batches = self._scatter_data(tensor_dict, pack_minibatches=True)
+        self._load_model_to_gpu()
 
         for model in self.model:
             model.train()
@@ -144,7 +169,11 @@ class MegatronActor(MegatronWorker):
                 mpu.get_data_parallel_group()
             )
 
-            def f(minibatch, cu_seqlens, logits):
+            def f(
+                minibatch: Dict[str, torch.Tensor],
+                cu_seqlens: torch.Tensor,
+                logits: torch.Tensor
+            ) -> Tuple[torch.Tensor, Dict[str, List[float]]]:
             
                 compute_logps_and_entropy(
                     logits / getattr(self.config, "temperature", 1.0),
@@ -158,51 +187,28 @@ class MegatronActor(MegatronWorker):
                     cu_seqlens
                 )
 
-                ratio = torch.exp(
-                    minibatch["logps"] - minibatch.get(
-                        "old_logps", minibatch["logps"].detach()
-                    )
+                losses, clip_ratios, llm_old_approx_kl = actor_ppo_loss(
+                    self.config, minibatch
                 )
-                clipped_ratio = torch.clamp(
-                    ratio, 1 - self.config.clip, 1 + self.config.clip
-                )
-                objective = minibatch["advantages"] * ratio
-                clipped_objective = minibatch["advantages"] * clipped_ratio
-                losses = - torch.min(objective, clipped_objective)
-                clip_ratios = objective > clipped_objective
 
-                if self.config.tis_coef > 0:
-                    # https://fengyao.notion.site/off-policy-rl
-                    tis = torch.exp(
-                        minibatch["logps"].detach() - minibatch["llm_logps"]
-                    ).clamp(max=self.config.tis_coef)
-                    losses *= tis
-
-                loss, clip_ratio, entropy = aggregate_values(
-                    (losses, clip_ratios, minibatch["entropy"]),
+                loss, clip_ratio, llm_old_approx_kl, entropy = aggregate_values(
+                    (losses,  clip_ratios, llm_old_approx_kl, minibatch["entropy"]),
                     minibatch["action_mask"],
                     self.config.avg_level,
                     total_actions,
                     total_sequences
                 )
-                loss = loss - self.config.entropy.coef * entropy
-                if self.config.kl.coef > 0 and self.config.kl.type == "loss":
-                    kl_loss = compute_approx_kl(
-                        minibatch["logps"],
-                        minibatch["ref_logps"],
-                        self.config.kl.loss_estimator
-                    ).sum() / total_actions
-                    loss = loss + self.config.kl.coef * kl_loss
 
                 metric = {
                     "actor/entropy": [entropy.item()],
                     "actor/loss": [loss.item()],
                     "actor/clip_ratio": [clip_ratio.item()],
+                    "actor/llm_old_approx_kl": [llm_old_approx_kl.item()],
                 }
 
-                return self.scale_loss(loss), 1, metric
+                return self._scale_loss(loss), metric
             
-            metric, grad_norm = self.forward_backward(f, batch)
+            metric, grad_norm = self._forward_backward(f, batch)
             for k, v in metric.items():
                 metrics[k].append(
                     gather_and_reduce(v, mpu.get_data_parallel_group())
@@ -210,12 +216,15 @@ class MegatronActor(MegatronWorker):
             metrics["actor/grad_norm"].append(grad_norm)
 
         rank0_log(metrics, step)
-        self.offload_model_to_cpu()
+        if self.config.adv_estimator == "gae":
+            self._offload_model_to_cpu()
 
     @time_logger("update_rollout")
     def update_rollout(self, rollout, step):
 
-        self.load_model_to_gpu()
-        named_tensor_generator = self.bridge.export_weights(self.model)
+        self._load_model_to_gpu()
+        named_tensor_generator = self.bridge.export_hf_weights(
+            self.model, cpu=True
+        )
         rollout.update(named_tensor_generator)
-        self.offload_model_to_cpu()
+        self._offload_model_to_cpu()

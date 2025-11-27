@@ -1,4 +1,4 @@
-from typing import List
+from typing import Dict, List, Optional, Union, Tuple
 import math
 import torch
 import torch.nn.functional as F
@@ -7,25 +7,25 @@ import torch.distributed as dist
 from RL2.utils.communication import broadcast_object, gather_and_concat_list
 from RL2.utils.seqlen_balance import get_seqlen_balanced_partitions
 
-def tensor_dict_to_minibatches(
-    tensor_dict,
-    dp_size,
-    max_length_per_dp,
+def _tensor_dict_to_minibatches(
+    tensor_dict: Dict[str, torch.Tensor],
+    multiple_of: int,
+    max_length_per_dp: int,
     pair: bool
-):
-
-    # We pack sequences into minibatches for higher throughput.
-    # There are two constrains:
-    #   * The length of any minibatch cannot exceed `max_length_per_dp`
-    #   * The number of minibatches must be multiple of dp size (so that
-    #     each dp shares identical number of minibatches)
-    # To satisfy the first constraint, the number of minibatches must be
-    # at least `math.ceil(total_length / max_length_per_dp)`.
-    # Starting from the first multiple of dp size that is no less than 
-    # the value, we pack sequences into `n_minibatches` minibatches and 
-    # check whether the first constraint is satisfied. If not, we increase 
-    # `n_minibatches` by dp size (so that the second constraint is always 
-    # satisfied) and repeat the loop.
+) -> List[Dict[str, torch.Tensor]]:
+    """
+    Pack sequences into minibatches for higher throughput.
+    There are two constrains:
+      * The number of minibatches must be multiple of `multiple_of`
+      * The length of any minibatch cannot exceed `max_length_per_dp`
+    To satisfy the second constraint, the number of minibatches must be
+    at least `math.ceil(total_length / max_length_per_dp)`.
+    Starting from the first multiple of `multiple_of` that is no less 
+    than the value, we pack sequences into `n_minibatches` minibatches 
+    and check whether the second constraint is satisfied. If not, we 
+    increase `n_minibatches` by `multiple_of` (so that the first 
+    constraint is always satisfied) and repeat the loop.
+    """
     seq_len_list = (tensor_dict["eos_mask"].argmax(-1) + 1).tolist()
     if pair:
         # When pair, every two adjacent sequences will be colocated, so 
@@ -33,10 +33,10 @@ def tensor_dict_to_minibatches(
         seq_len_list = torch.tensor(seq_len_list).view(-1, 2).sum(-1).tolist()
     assert max(seq_len_list) <= max_length_per_dp, \
         f"The longest sequence has a length of {max(seq_len_list)}," \
-        f"which exceeds the maximum length per dp {max_length_per_dp}."
+        f"which exceeds the maximum length per DP {max_length_per_dp}."
     n_minibatches = math.ceil(sum(seq_len_list) / max_length_per_dp)
-    if n_minibatches % dp_size != 0:
-        n_minibatches += dp_size - n_minibatches % dp_size
+    if n_minibatches % multiple_of != 0:
+        n_minibatches += multiple_of - n_minibatches % multiple_of
 
     # Partition sequences into n_minibatches balanced minibatches.
     while True:
@@ -65,15 +65,17 @@ def tensor_dict_to_minibatches(
         ])
         if max_minibatch_length <= max_length_per_dp:
             break
-        n_minibatches += dp_size
+        n_minibatches += multiple_of
 
     if pair:
         partitions = [
-            sum([[2 * p, 2 * p + 1] for p in partition], [])
+            [_p for p in partition for _p in [2 * p, 2 * p + 1]]
             for partition in partitions
         ]
     global SHUFFLE_INDICES
-    SHUFFLE_INDICES = sum(partitions, [])
+    SHUFFLE_INDICES = [
+        p for partition in partitions for p in partition
+    ]
 
     return [
         {
@@ -83,12 +85,13 @@ def tensor_dict_to_minibatches(
     ]
 
 def scatter_data(
-    tensor_dict,
-    process_group,
-    max_length_per_dp,
-    num_batches=None,
-    pair=False
-):
+    tensor_dict: Dict[str, torch.Tensor],
+    process_group: dist.ProcessGroup,
+    multiple_of: int,
+    max_length_per_dp: int,
+    num_batches: Optional[int] = None,
+    pair: bool = False
+) -> Union[List[Dict[str, torch.Tensor]], List[List[Dict[str, torch.Tensor]]]]:
 
     if num_batches is not None:
         if dist.get_rank() == 0:
@@ -101,25 +104,24 @@ def scatter_data(
                 }
                 batches.append(
                     scatter_data(
-                        batch_tensor_dict, process_group, max_length_per_dp, pair=pair
+                        batch_tensor_dict, process_group, multiple_of, max_length_per_dp, pair=pair
                     )
                 )
             return batches
         else:
             return [
-                scatter_data(None, process_group, max_length_per_dp, pair=pair)
+                scatter_data(None, process_group, multiple_of, max_length_per_dp, pair=pair)
                 for _ in range(num_batches)
             ]
 
     dp_rank = dist.get_rank(process_group)
     dp_size = dist.get_world_size(process_group)
     if dist.get_rank() == 0:
-        minibatches = tensor_dict_to_minibatches(
-            tensor_dict, dp_size, max_length_per_dp, pair
+        minibatches = _tensor_dict_to_minibatches(
+            tensor_dict, multiple_of, max_length_per_dp, pair
         )
     minibatches = broadcast_object(
-        minibatches if dist.get_rank() == 0 else None,
-        src=0
+        minibatches if dist.get_rank() == 0 else None, 0
     )
     chunk_size = len(minibatches) // dp_size
     minibatches = minibatches[dp_rank * chunk_size:(dp_rank + 1) * chunk_size]
@@ -131,7 +133,10 @@ def scatter_data(
         for minibatch in minibatches
     ]
 
-def gather_data(minibatches, process_group):
+def gather_data(
+    minibatches: List[Dict[str, torch.Tensor]],
+    process_group: dist.ProcessGroup
+) -> Optional[Dict[str, torch.Tensor]]:
     
     minibatches = [
         {
@@ -185,7 +190,11 @@ def gather_data(minibatches, process_group):
 
         return tensor_dict
 
-def count_total(minibatches, key, process_group):
+def count_total(
+    minibatches: List[Dict[str, torch.Tensor]],
+    key: Union[str, Tuple[str]],
+    process_group: dist.ProcessGroup
+) -> Union[int, Tuple[int]]:
 
     if isinstance(key, tuple):
         return tuple(
@@ -206,11 +215,15 @@ def count_total(minibatches, key, process_group):
     )
     return total.to("cpu").item()
 
-def slide_along_cp(minibatch, process_group, multiple_of):
+def slide_along_cp(
+    minibatch: Dict[str, torch.Tensor],
+    process_group: dist.ProcessGroup,
+    multiple_of: int
+) -> Tuple[Dict[str, torch.Tensor], torch.Tensor]:
 
     cp_rank = dist.get_rank(process_group)
     cp_size = dist.get_world_size(process_group)
-    def slide_tensor_along_cp(tensor):
+    def _slide_tensor_along_cp(tensor: torch.Tensor) -> torch.Tensor:
 
         if len(tensor) % (2 * cp_size) != 0:
             pad_tokens = 2 * cp_size - len(tensor) % (2 * cp_size)
@@ -224,7 +237,7 @@ def slide_along_cp(minibatch, process_group, multiple_of):
     processed_minibatch = {}
     for k, v in minibatch.items():
         tensors = [
-            slide_tensor_along_cp(tensor[:seq_len])
+            _slide_tensor_along_cp(tensor[:seq_len])
             for tensor, seq_len in zip(v, seq_lens)
         ]
         length = sum([len(tensor) for tensor in tensors])
@@ -246,7 +259,11 @@ def slide_along_cp(minibatch, process_group, multiple_of):
     ).to(torch.cuda.current_device())
     return processed_minibatch, cu_seqlens
 
-def gather_along_cp(minibatch, process_group, cu_seqlens):
+def gather_along_cp(
+    minibatch: Dict[str, torch.Tensor],
+    process_group: dist.ProcessGroup,
+    cu_seqlens: torch.Tensor
+) -> Dict[str, torch.Tensor]:
     
     cp_rank = dist.get_rank(process_group)
     cp_size = dist.get_world_size(process_group)

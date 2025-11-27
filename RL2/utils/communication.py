@@ -1,7 +1,21 @@
+from typing import Any, Optional, List
 import os
+import socket
 from datetime import timedelta
 import torch
 import torch.distributed as dist
+
+def get_host() -> str:
+
+    hostname = socket.gethostname()
+    return socket.gethostbyname(hostname)
+
+def get_available_port() -> int:
+
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+        s.bind(("", 0))
+        s.listen(1)
+        return s.getsockname()[1]
 
 def initialize_global_process_group(timeout_second=36000):
     # 单卡模式使用 gloo 后端,避免 NCCL 网络配置问题   × 错误的设置
@@ -11,26 +25,37 @@ def initialize_global_process_group(timeout_second=36000):
     local_rank = int(os.environ["LOCAL_RANK"])
     torch.cuda.set_device(local_rank)
 
-def _unwrap_process_group(process_group):
-    if hasattr(process_group, '_wrapped'):
-        process_group = process_group._wrapped
-    elif hasattr(process_group, 'group'):
-        process_group = process_group.group
-    return process_group
+def _unwrap_process_group(
+    process_group: dist.ProcessGroup
+) -> dist.ProcessGroup:
 
-def broadcast_object(obj, src=None, group=None, group_src=None):
+    if hasattr(process_group, "group"):
+        return process_group.group
+    elif hasattr(process_group, "get_group"):
+        return process_group.get_group()
+    else:
+        return process_group
+
+def broadcast_object(
+    obj: Optional[Any],
+    src: Optional[int] = None,
+    process_group: Optional[dist.ProcessGroup] = None,
+    group_src: Optional[int] = None
+) -> Any:
+
     object_list = [obj]
     dist.broadcast_object_list(
         object_list,
         src=src,
-        group=_unwrap_process_group(group),
+        group=_unwrap_process_group(process_group),
         group_src=group_src
     )
     return object_list[0]
 
-def gather_and_concat_list(lst, process_group):
+def gather_and_concat_list(
+    lst: List[Any], process_group: dist.ProcessGroup
+) -> Optional[List[Any]]:
 
-    process_group = _unwrap_process_group(process_group)
     lists = (
         dist.get_world_size(process_group) * [None]
         if dist.get_rank(process_group) == 0
@@ -39,7 +64,11 @@ def gather_and_concat_list(lst, process_group):
     dist.gather_object(
         lst,
         lists,
-        group=process_group,
+        group=_unwrap_process_group(process_group),
         group_dst=0
     )
-    return sum(lists, []) if dist.get_rank(process_group) == 0 else None
+    return (
+        [item for lst in lists for item in lst]
+        if dist.get_rank(process_group) == 0
+        else None
+    )

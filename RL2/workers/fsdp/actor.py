@@ -1,6 +1,7 @@
+from typing import Dict, Optional
+from omegaconf import DictConfig
 from collections import defaultdict
 import torch
-import torch.nn.functional as F
 from transformers import AutoModelForCausalLM
 from RL2.workers.fsdp import FSDPWorker
 from RL2.utils.sequences import count_total, slide_along_cp, gather_along_cp
@@ -8,7 +9,7 @@ from RL2.utils.fsdp.context_parallelism import update_ring_attn_params
 from RL2.utils.functions import (
     compute_logps_and_entropy, aggregate_values
 )
-from RL2.utils.algorithms import compute_approx_kl
+from RL2.utils.algorithms import dpo_loss, actor_ppo_loss
 from RL2.utils.logging import (
     progress_bar,
     time_logger,
@@ -20,7 +21,7 @@ from RL2.utils.logging import (
 
 class FSDPActor(FSDPWorker):
 
-    def __init__(self, config, train: bool):
+    def __init__(self, config: DictConfig, train: bool):
         super().__init__(config, train)
 
         if config.use_liger_kernel:
@@ -31,16 +32,21 @@ class FSDPActor(FSDPWorker):
         else:
             model_cls = AutoModelForCausalLM
 
-        with self.init_weight_context():
+        with self._init_weight_context():
             self.model = model_cls.from_pretrained(
                 config.model_name,
                 trust_remote_code=True,
                 attn_implementation="flash_attention_2"
             )
 
-        self.prepare_model_optimizer()
+        self._prepare_model_optimizer()
 
-    def forward(self, minibatch, prefix=None, return_entropy=False):
+    def _forward(
+        self,
+        minibatch: Dict[str, torch.Tensor],
+        prefix: str = "",
+        return_entropy: bool = False
+    ) -> Dict[str, torch.Tensor]:
 
         minibatch, cu_seqlens = slide_along_cp(
             minibatch,
@@ -73,26 +79,35 @@ class FSDPActor(FSDPWorker):
 
     @time_logger("compute_logps")
     @torch.no_grad()
-    def compute_logps(self, tensor_dict, step):
-        minibatches = self.scatter_data(tensor_dict)
-        self.load_model_to_device(torch.cuda.current_device())
+    def compute_logps(
+        self,
+        tensor_dict: Optional[Dict[str, torch.Tensor]],
+        step: int,
+        pair: bool = False
+    ) -> Optional[Dict[str, torch.Tensor]]:
+        minibatches = self._scatter_data(tensor_dict, pair=pair)
+        self._load_model_to_device(torch.cuda.current_device())
 
-        prefix = "old" if self.train else "ref"
+        prefix = "old_" if self.train else "ref_"
         self.model.eval()
         processed_minibatches = []
         for minibatch in progress_bar(
-            minibatches, desc=f"Compute {prefix} logps"
+            minibatches, desc=f"Compute {prefix}logps"
         ):
-            processed_minibatch = self.forward(minibatch, prefix)
+            processed_minibatch = self._forward(minibatch, prefix)
             processed_minibatches.append(processed_minibatch)
 
         if not self.train:
-            self.load_model_to_device("cpu")
-        return self.gather_data(processed_minibatches)
+            self._load_model_to_device("cpu")
+        return self._gather_data(processed_minibatches)
 
     @time_logger("update_actor")
-    def sft_update(self, tensor_dict, step):
-        minibatches = self.scatter_data(tensor_dict)
+    def sft_update(
+        self,
+        tensor_dict: Optional[Dict[str, torch.Tensor]],
+        step: int
+    ):
+        minibatches = self._scatter_data(tensor_dict)
 
         total_actions, total_sequences = count_total(
             minibatches,
@@ -103,7 +118,7 @@ class FSDPActor(FSDPWorker):
         for minibatch in progress_bar(
             minibatches, desc="Update actor"
         ):
-            minibatch = self.forward(minibatch)
+            minibatch = self._forward(minibatch)
             loss = aggregate_values(
                 - minibatch["logps"],
                 minibatch["action_mask"],
@@ -111,16 +126,20 @@ class FSDPActor(FSDPWorker):
                 total_actions,
                 total_sequences
             )
-            self.scale_loss(loss).backward()
+            self._scale_loss(loss).backward()
             metrics["loss"].append(loss.item())
 
-        grad_norm = self.optimizer_step()
+        grad_norm = self._optimizer_step()
         metrics["grad_norm"].append(grad_norm)
         gather_and_log(metrics, step, self.device_mesh["dp"].get_group())
 
     @time_logger("update_actor")
-    def dpo_update(self, tensor_dict, step):
-        minibatches = self.scatter_data(tensor_dict, pair=True)
+    def dpo_update(
+        self,
+        tensor_dict: Optional[Dict[str, torch.Tensor]],
+        step: int
+    ):
+        minibatches = self._scatter_data(tensor_dict, pair=True)
 
         total_pairs = count_total(
             minibatches, "eos_mask", self.device_mesh["dp"].get_group()
@@ -129,29 +148,28 @@ class FSDPActor(FSDPWorker):
         for minibatch in progress_bar(
             minibatches, desc="Update actor"
         ):
-            minibatch = self.forward(minibatch)
-            chosen_rewards, rejected_rewards = self.config.beta * (
-                minibatch["logps"] - minibatch["ref_logps"]
-            ).sum(-1).view(-1, 2).T
-            reward_margins = chosen_rewards - rejected_rewards
-            loss = - F.logsigmoid(reward_margins).sum() / total_pairs
-            self.scale_loss(loss).backward()
-            metrics["rewards/chosen"].extend(chosen_rewards.tolist())
-            metrics["rewards/rejected"].extend(rejected_rewards.tolist())
-            metrics["rewards/margin"].extend(reward_margins.tolist())
-            metrics["loss"].append(loss.item())
-            metrics["accuracy"].extend((reward_margins > 0).tolist())
+            minibatch = self._forward(minibatch)
+            losses, metric = dpo_loss(self.config, minibatch)
+            loss = losses.sum() / total_pairs
+            self._scale_loss(loss).backward()
+            metric["loss"] = [loss.item()]
+            for k, v in metric.items():
+                metrics[k].extend(v)
 
-        grad_norm = self.optimizer_step()
+        grad_norm = self._optimizer_step()
         metrics["grad_norm"].append(grad_norm)
         gather_and_log(metrics, step, self.device_mesh["dp"].get_group())
     
     @time_logger("update_actor")
-    def ppo_update(self, tensor_dict, step: int):
+    def ppo_update(
+        self,
+        tensor_dict: Optional[Dict[str, torch.Tensor]],
+        step: int
+    ):
         if step < self.config.freeze_steps:
             return
-        batches = self.scatter_data(tensor_dict, pack_minibatches=True)
-        self.load_model_to_device(torch.cuda.current_device())
+        batches = self._scatter_data(tensor_dict, pack_minibatches=True)
+        self._load_model_to_device(torch.cuda.current_device())
 
         self.model.train()
         tbar = progress_bar(
@@ -169,53 +187,30 @@ class FSDPActor(FSDPWorker):
             metric = defaultdict(list)
             for minibatch in batch:
 
-                minibatch = self.forward(
+                minibatch = self._forward(
                     minibatch, return_entropy=True
                 )
-                ratio = torch.exp(
-                    minibatch["logps"] - minibatch.get(
-                        "old_logps", minibatch["logps"].detach()
-                    )
+                losses, clip_ratios, llm_old_approx_kl = actor_ppo_loss(
+                    self.config, minibatch
                 )
-                clipped_ratio = torch.clamp(
-                    ratio, 1 - self.config.clip, 1 + self.config.clip
-                )
-                objective = minibatch["advantages"] * ratio
-                clipped_objective = minibatch["advantages"] * clipped_ratio
-                losses = - torch.min(objective, clipped_objective)
-                clip_ratios = objective > clipped_objective
-
-                if self.config.tis_coef > 0:
-                    # https://fengyao.notion.site/off-policy-rl
-                    tis = torch.exp(
-                        minibatch["logps"].detach() - minibatch["llm_logps"]
-                    ).clamp(max=self.config.tis_coef)
-                    losses *= tis
                     
-                loss, clip_ratio, entropy = aggregate_values(
-                    (losses, clip_ratios, minibatch["entropy"]),
+                loss, clip_ratio, llm_old_approx_kl, entropy = aggregate_values(
+                    (losses, clip_ratios, llm_old_approx_kl, minibatch["entropy"]),
                     minibatch["action_mask"],
                     self.config.avg_level,
                     total_actions,
                     total_sequences
                 )
-                loss = loss - self.config.entropy.coef * entropy
-                if self.config.kl.coef > 0 and self.config.kl.type == "loss":
-                    kl_loss = compute_approx_kl(
-                        minibatch["logps"],
-                        minibatch["ref_logps"],
-                        self.config.kl.loss_estimator
-                    ).sum() / total_actions
-                    loss = loss + self.config.kl.coef * kl_loss
 
-                self.scale_loss(loss).backward()
+                self._scale_loss(loss).backward()
 
                 tbar.update()
                 metric["actor/entropy"].append(entropy.item())
                 metric["actor/loss"].append(loss.item())
                 metric["actor/clip_ratio"].append(clip_ratio.item())
+                metric["actor/llm_old_approx_kl"].append(llm_old_approx_kl.item())
 
-            grad_norm = self.optimizer_step()
+            grad_norm = self._optimizer_step()
 
             for k, v in metric.items():
                 metrics[k].append(
@@ -224,10 +219,16 @@ class FSDPActor(FSDPWorker):
             metrics["actor/grad_norm"].append(grad_norm)
 
         rank0_log(metrics, step)
-        self.load_model_to_device("cpu")
+        if self.config.adv_estimator == "gae":
+            self._load_model_to_device("cpu")
 
     @time_logger("update_rollout")
     def update_rollout(self, rollout, step):
 
-        state_dict = self.get_model_state_dict(cpu_offload=False)
-        rollout.update(state_dict.items())
+        state_dict = self._get_model_state_dict()
+        rollout.update(
+            progress_bar(
+                state_dict.items(),
+                desc="Update rollout"
+            )
+        )

@@ -1,5 +1,6 @@
 from .base import (
     BaseDataset,
+    StatefulCycleDataLoader,
     get_dataloader,
     get_tensor_dict,
     pack_tensor_dicts
@@ -7,4 +8,7 @@ from .base import (
 from .sft import SFTDataset
 from .rm import RMDataset
 from .dpo import DPODataset
-from .rl import RLDataset
+from .rl import (
+    ExperienceGroup,
+    RLDataset
+)

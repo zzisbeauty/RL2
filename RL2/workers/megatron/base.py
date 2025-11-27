@@ -1,14 +1,18 @@
-from omegaconf import OmegaConf
+from typing import Dict, Union, List, Optional, Callable, Tuple, Iterator, Any
+from omegaconf import OmegaConf, DictConfig
 import os
 import gc
 from functools import partial
 import torch
+import torch.nn as nn
 import torch.distributed as dist
-from transformers import AutoConfig
 from megatron.core import (
     parallel_state as mpu,
-    tensor_parallel,
     dist_checkpointing
+)
+from megatron.core.distributed import (
+    DistributedDataParallel as DDP,
+    DistributedDataParallelConfig
 )
 from megatron.core.optimizer import OptimizerConfig, get_megatron_optimizer
 from megatron.core.optimizer_param_scheduler import OptimizerParamScheduler
@@ -22,63 +26,63 @@ from megatron.core.dist_checkpointing.strategies.fully_parallel import (
     FullyParallelLoadStrategyWrapper,
     FullyParallelSaveStrategyWrapper
 )
-from mbridge import AutoBridge
+from megatron.bridge import AutoBridge
 from RL2.workers import Worker
 from RL2.utils.communication import broadcast_object
 from RL2.utils.sequences import scatter_data, gather_data, slide_along_cp
 
 
-
 class MegatronWorker(Worker):
 
-    def __init__(self, config, train: bool):
+    def __init__(self, config: DictConfig, train: bool):
         super().__init__(config, train)
         
-        config = AutoConfig.from_pretrained(config.model_name)
-        self.bridge = AutoBridge.from_config(config) # TODO (P0): support Qwen3-Next
-        tf_config = (
-            OmegaConf.to_container(self.config.tf_config)
-            if hasattr(self.config, "tf_config") else {}
-        )
-        self.bridge.set_extra_args(
-            bf16=True,
-            attention_backend="flash",
-            **tf_config
-        )
+        self.bridge = AutoBridge.from_hf_pretrained(config.model_name)
 
-    def prepare_device_mesh(self):
-
-        if not mpu.is_initialized():
-            # TODO: support vpp
-            mpu.initialize_model_parallel(
-                pipeline_model_parallel_size=self.config.pp_size,
-                context_parallel_size=self.config.cp_size,
-                tensor_model_parallel_size=self.config.tp_size,
-                expert_model_parallel_size=self.config.ep_size,
-                expert_tensor_parallel_size=self.config.etp_size
-            )
-            tensor_parallel.model_parallel_cuda_manual_seed(42)
-
-    def prepare_model_optimizer(self):
+        self.provider = self.bridge.to_megatron_provider()
         
-        self.bridge.load_weights(self.model, self.config.model_name)
+        dtype = getattr(torch, config.dtype)
+        self.provider.params_dtype = dtype
+        self.provider.autocast_dtype = dtype
+        self.provider.pipeline_dtype = dtype
+        self.provider.fp16 = config.dtype == "float16"
+        self.provider.bf16 = config.dtype == "bfloat16"
+        self.provider.attention_backend = "flash"
+        self.provider.variable_seq_lengths = True
+        self.provider.moe_token_dispatcher_type = "alltoall"
+        tf_config = OmegaConf.to_container(config.tf_config)
+        for k, v in tf_config.items():
+            setattr(self.provider, k, v)
+        self.provider.sequence_parallel = self.provider.tensor_model_parallel_size > 1
+        self.provider.finalize()
+        if not mpu.is_initialized():
+            self.provider.initialize_model_parallel(seed=42)
+
+        ddp_config = OmegaConf.to_container(config.ddp_config)
+        self.ddp_config = DistributedDataParallelConfig(**ddp_config)
+
+    def _prepare_model_optimizer(self):
+
+        if dist.get_rank() == 0:
+            print(self.model[0].config)
 
         if self.train:
 
             optimizer_config = OmegaConf.to_container(self.config.optimizer)
             optimizer_config = OptimizerConfig(
-                bf16=True,
-                params_dtype=torch.bfloat16,
-                use_distributed_optimizer=True,
+                fp16=self.config.dtype == "float16",
+                bf16=self.config.dtype == "bfloat16",
+                params_dtype=getattr(torch, self.config.dtype),
+                use_distributed_optimizer=self.config.ddp_config.use_distributed_optimizer,
                 **optimizer_config
             )
             self.optimizer = get_megatron_optimizer(
                 optimizer_config, self.model
             )
 
-        self.offload_model_to_cpu()
+        self._offload_model_to_cpu()
 
-    def prepare_scheduler(self, total_steps):
+    def prepare_scheduler(self, total_steps: int):
 
         num_training_steps = total_steps * getattr(
             self.config, "update_per_rollout", 1
@@ -98,12 +102,15 @@ class MegatronWorker(Worker):
             **scheduler_config
         )
 
-    def scatter_data(
+    def _scatter_data(
         self,
-        tensor_dict,
+        tensor_dict: Dict[str, torch.Tensor],
         pack_minibatches: bool = False,
         pair: bool = False
-    ):
+    ) -> Union[List[Dict[str, torch.Tensor]], List[List[Dict[str, torch.Tensor]]]]:
+        multiple_of = mpu.get_data_parallel_world_size()
+        if mpu.get_virtual_pipeline_model_parallel_world_size() is not None:
+            multiple_of *= mpu.get_pipeline_model_parallel_world_size()
         max_length_per_dp = mpu.get_context_parallel_world_size() * mpu.get_tensor_model_parallel_world_size() * (
             self.config.max_length_per_device
             if torch.is_grad_enabled()
@@ -112,49 +119,61 @@ class MegatronWorker(Worker):
         return scatter_data(
             tensor_dict,
             mpu.get_data_parallel_group(),
+            multiple_of,
             max_length_per_dp,
             self.config.update_per_rollout if pack_minibatches else None,
             pair
         )
 
-    def gather_data(self, minibatches):
+    def _gather_data(
+        self, minibatches: List[Dict[str, torch.Tensor]]
+    ) -> Optional[Dict[str, torch.Tensor]]:
         return gather_data(minibatches, mpu.get_data_parallel_group())
 
-    def offload_model_to_cpu(self):
+    def _offload_model_to_cpu(self):
 
         if not getattr(self.config, "offload_model", False):
             return
 
-        for model in self.model:
-            for buffers in [model.buffers, model.expert_parallel_buffers]:
-                for buffer in buffers:
-                    if buffer.param_data.storage().size() > 0:
-                        buffer.param_data.cpu_data = buffer.param_data.data.cpu().pin_memory()
-                        buffer.param_data_size = buffer.param_data.storage().size()
-                        buffer.param_data.storage().resize_(0)
-
         gc.collect()
+        for model in self.model:
+            if isinstance(model, DDP):
+                for buffers in [model.buffers, model.expert_parallel_buffers]:
+                    for buffer in buffers:
+                        if buffer.param_data.storage().size() > 0:
+                            buffer.param_data.cpu_data = buffer.param_data.data.cpu().pin_memory()
+                            buffer.param_data_size = buffer.param_data.storage().size()
+                            buffer.param_data.storage().resize_(0)
+            else:
+                for _, param in model.named_parameters():
+                    param.data = param.data.to("cpu", non_blocking=True)
         torch.cuda.empty_cache()
 
-    def load_model_to_gpu(self):
+    def _load_model_to_gpu(self):
 
         if not getattr(self.config, "offload_model", False):
             return
 
-        for model in self.model:
-            for buffers in [model.buffers, model.expert_parallel_buffers]:
-                for buffer in buffers:
-                    if buffer.param_data.storage().size() == 0:
-                        buffer.param_data.storage().resize_(buffer.param_data_size)
-                        buffer.param_data.copy_(
-                            buffer.param_data.cpu_data,
-                            non_blocking=True
-                        )
-
-        gc.collect()
         torch.cuda.empty_cache()
+        for model in self.model:
+            if isinstance(model, DDP):
+                for buffers in [model.buffers, model.expert_parallel_buffers]:
+                    for buffer in buffers:
+                        if buffer.param_data.storage().size() == 0:
+                            buffer.param_data.storage().resize_(buffer.param_data_size)
+                            buffer.param_data.copy_(
+                                buffer.param_data.cpu_data,
+                                non_blocking=True
+                            )
+            else:
+                for _, param in model.named_parameters():
+                    param.data = param.data.to(
+                        torch.cuda.current_device(),
+                        non_blocking=True
+                    )
+        gc.collect()
 
-    def load_optimizer_to_device(self, device):
+    def _load_optimizer_to_device(self, device: Union[torch.device, str]):
 
         if not getattr(self.config, "offload_optimizer", False):
             return
@@ -176,12 +195,18 @@ class MegatronWorker(Worker):
             gc.collect()
             torch.cuda.empty_cache()
 
-    def scale_loss(self, loss):
+    def _scale_loss(self, loss: torch.Tensor) -> torch.Tensor:
         return mpu.get_data_parallel_world_size(with_context_parallel=True) * loss
 
-    def forward_backward(self, f, minibatches):
+    def _forward_backward(
+        self,
+        f: Callable,
+        minibatches: List[Dict[str, torch.Tensor]]
+    ) -> Union[Tuple[Dict[str, List[float]], torch.Tensor], List[Dict[str, torch.Tensor]]]:
 
-        def forward_step(data_iterator, model):
+        def _forward_step(
+            data_iterator: Iterator, model: List[Union[DDP, nn.Module]]
+        ) -> Tuple[torch.Tensor, Callable]:
 
             minibatch = next(data_iterator)
             minibatch, cu_seqlens = slide_along_cp(
@@ -209,11 +234,16 @@ class MegatronWorker(Worker):
             return output_tensor, partial(f, minibatch, cu_seqlens)
 
         forward_backward = get_forward_backward_func()
+        vpp_size = mpu.get_virtual_pipeline_model_parallel_world_size()
+        if vpp_size:
+            data_iterator = [iter(minibatches) for _ in range(vpp_size)]
+        else:
+            data_iterator = iter(minibatches)
         output = forward_backward(
             model=self.model,
-            data_iterator=iter(minibatches),
+            data_iterator=data_iterator,
             num_microbatches=len(minibatches),
-            forward_step_func=forward_step,
+            forward_step_func=_forward_step,
             seq_length=1,
             micro_batch_size=1,
             forward_only=not torch.is_grad_enabled(),
@@ -221,26 +251,26 @@ class MegatronWorker(Worker):
         )
         output = broadcast_object(
             output,
-            group=mpu.get_pipeline_model_parallel_group(),
+            process_group=mpu.get_pipeline_model_parallel_group(),
             group_src=mpu.get_pipeline_model_parallel_world_size() - 1
         )
         if torch.is_grad_enabled():
-            self.load_optimizer_to_device(torch.cuda.current_device())
+            self._load_optimizer_to_device(torch.cuda.current_device())
             _, grad_norm, _ = self.optimizer.step()
+            self.optimizer.zero_grad()
+            self._load_optimizer_to_device("cpu")
             for model in self.model:
                 model.zero_grad_buffer()
-            self.optimizer.zero_grad()
-            self.load_optimizer_to_device("cpu")
             self.scheduler.step(1)
             metrics = {
-                k: sum([metric[k] for metric in output], [])
+                k: [item for metric in output for item in metric[k]]
                 for k in output[0].keys()
             }
             return metrics, grad_norm
         else:
             return output
 
-    def get_ckpt(self):
+    def _get_ckpt(self) -> Dict[str, Dict[str, Any]]:
 
         ckpt = {}
         for vpp_rank, model in enumerate(self.model):
@@ -257,9 +287,9 @@ class MegatronWorker(Worker):
         }
         return ckpt
 
-    def load_ckpt(self, save_dir):
+    def load_ckpt(self, save_dir: str):
         
-        ckpt = self.get_ckpt()
+        ckpt = self._get_ckpt()
         sharded_strategy = get_default_load_sharded_strategy(save_dir)
         sharded_strategy = FullyParallelLoadStrategyWrapper(
             sharded_strategy,
@@ -273,7 +303,7 @@ class MegatronWorker(Worker):
         self.optimizer.load_state_dict(ckpt["optimizer"])
         self.scheduler.load_state_dict(ckpt["scheduler"])
 
-    def save_ckpt(self, save_dir):
+    def save_ckpt(self, save_dir: str):
 
         self.save_model(f"{save_dir}/model")
         sharded_strategy = get_default_save_sharded_strategy("torch_dist")
@@ -283,16 +313,16 @@ class MegatronWorker(Worker):
         )
         os.makedirs(f"{save_dir}/optimizer_scheduler", exist_ok=True)
         dist_checkpointing.save(
-            self.get_ckpt(),
+            self._get_ckpt(),
             f"{save_dir}/optimizer_scheduler",
             sharded_strategy=sharded_strategy
         )
 
-    def save_model(self, save_dir):
+    def save_model(self, save_dir: str):
 
-        self.load_model_to_gpu()
-        self.bridge.save_weights(self.model, save_dir)
-        self.offload_model_to_cpu()
+        self._load_model_to_gpu()
+        self.bridge.save_hf_pretrained(self.model, save_dir)
+        self._offload_model_to_cpu()
         if dist.get_rank() == 0:
             self.tokenizer.save_pretrained(save_dir)
         dist.barrier()

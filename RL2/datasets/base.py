@@ -1,17 +1,20 @@
+from typing import List, Optional, Dict, Sequence, Any
+from omegaconf import DictConfig
 import os
 import datasets
 import torch
 from torch.utils.data import Dataset
 from torch.nn.utils.rnn import pad_sequence
 from torchdata.stateful_dataloader import StatefulDataLoader
+from transformers import AutoTokenizer
 
 def get_tensor_dict(
-    states,
-    actions,
-    action_mask,
-    max_length=None,
-    rm=False
-):
+    states: List[int],
+    actions: List[int],
+    action_mask: List[int],
+    max_length: Optional[int] = None,
+    rm: bool = False
+) -> Dict[str, torch.Tensor]:
 
     if not rm:
         states = states[:-1]
@@ -31,17 +34,19 @@ def get_tensor_dict(
     if rm:
         tensor_dict["action_mask"] = torch.LongTensor(
             (len(states) - 1) * [0] + [1]
-        )
+        ) # rewards of non-terminal tokens are all zeros
     else:
         tensor_dict["actions"] = torch.LongTensor(actions)
         tensor_dict["action_mask"] = torch.LongTensor(action_mask)
 
     return tensor_dict
 
-def pack_tensor_dicts(tensor_dicts):
+def pack_tensor_dicts(
+    tensor_dicts: Sequence[Dict[str, torch.Tensor]]
+) -> Dict[str, torch.Tensor]:
     return {
         k: pad_sequence(
-            [tensor_dict[k] for tensor_dict in tensor_dicts], True
+            [td[k] for td in tensor_dicts], True
         )
         for k in tensor_dicts[0].keys()
     }
@@ -49,15 +54,13 @@ def pack_tensor_dicts(tensor_dicts):
 
 class BaseDataset(Dataset):
     
-    def __init__(self, config, tokenizer):
+    def __init__(self, config: DictConfig, tokenizer: AutoTokenizer):
 
         self.config = config
         self.tokenizer = tokenizer
         
         # TODO: support concatnating multiple datasets
-        if not config.path:
-            self.dataset = [{} for _ in range(config.prompts_per_rollout)] # for Gym like environments
-        else:
+        if config.path:
             if "@" in config.path:
                 split, path = config.path.split("@")
             else:
@@ -69,10 +72,12 @@ class BaseDataset(Dataset):
                 self.dataset = datasets.load_dataset(ext, data_files=path, split=split)
             else:
                 self.dataset = datasets.load_dataset(path, split=split)
+        else: # Gym-like environments do not require datasets
+            self.dataset = [{} for _ in range(42)]
 
-    def tokenize_prompt_response(
-        self, prompt, response, rm=False
-    ):
+    def _tokenize_prompt_response(
+        self, prompt: str, response: str, rm: bool = False
+    ) -> Dict[str, torch.Tensor]:
         
         prompt = self.tokenizer.encode(
             prompt, add_special_tokens=False
@@ -90,45 +95,110 @@ class BaseDataset(Dataset):
             states, actions, action_mask, self.config.max_length, rm
         )
 
-    def tokenize_messages(self, messages, rm=False):
+    def _tokenize_messages(
+        self, messages: List[Dict[str, str]], rm: bool = False
+    ) -> List[Dict[str, torch.Tensor]]:
 
         prev_text, states, actions, action_mask = "", [], [], []
+        tensor_dicts = []
         for turn in range(len(messages)):
             
             is_this_turn_assistant = messages[turn]["role"] == "assistant"
             is_next_turn_assistant = turn + 1 < len(messages) and messages[turn + 1]["role"] == "assistant"
+
+            if not is_this_turn_assistant and not is_next_turn_assistant:
+                continue
 
             text = self.tokenizer.apply_chat_template(
                 messages[:turn + 1],
                 add_generation_prompt=is_next_turn_assistant,
                 tokenize=False
             )
-            assert text[:len(prev_text)] == prev_text
-            state = self.tokenizer.encode(
-                text[len(prev_text):], add_special_tokens=False
-            )
-            states.extend(state)
-            actions.extend(
-                state
-                if is_this_turn_assistant
-                else len(state) * [0]
-            )
-            action_mask.extend(len(state) * [is_this_turn_assistant])
+
+            if text.startswith(prev_text):
+        
+                state = self.tokenizer.encode(
+                    text[len(prev_text):], add_special_tokens=False
+                )
+                # This is NOT equivalent to 
+                #     next_states = apply_chat_template(..., tokenize=True)
+                #     state = next_states[len(states):]
+                states.extend(state)
+                actions.extend(
+                    state if is_this_turn_assistant
+                    else len(state) * [0]
+                )
+                action_mask.extend(
+                    len(state) * [is_this_turn_assistant]
+                )
+            
+            else:
+                assert is_next_turn_assistant
+
+                tensor_dicts.append(
+                    get_tensor_dict(
+                        states, actions, action_mask, self.config.max_length, rm
+                    )
+                )
+                states = self.tokenizer.encode(
+                    text, add_special_tokens=False
+                )
+                actions = len(states) * [0]
+                action_mask = len(states) * [0]
+
             prev_text = text
 
-        return get_tensor_dict(
-            states, actions, action_mask, self.config.max_length, rm
+        tensor_dicts.append(
+            get_tensor_dict(
+                states, actions, action_mask, self.config.max_length, rm
+            )
         )
+
+        return tensor_dicts
 
     def __len__(self):
         return len(self.dataset)
 
 
-def get_dataloader(dataset, batch_size):
-    return StatefulDataLoader(
-        dataset,
-        batch_size,
-        shuffle=True,
-        drop_last=True,
-        collate_fn=dataset.collate_fn
-    )
+class StatefulCycleDataLoader(StatefulDataLoader):
+
+    def __call__(self, batch_size: int) -> List[Dict[str, Any]]:
+        """
+        Fetch a variable number of data.
+        """
+        
+        if not hasattr(self, "iterator"):
+            self.iterator = iter(self)
+
+        data_list = []
+        for _ in range(batch_size):
+            try:
+                data = next(self.iterator)
+            except StopIteration:
+                self.iterator = iter(self)
+                data = next(self.iterator)
+            data_list.append(data)
+        return data_list
+
+
+def get_dataloader(
+    dataset: BaseDataset, batch_size: Optional[int] = None
+) -> StatefulDataLoader:
+
+    kwargs = {
+        "dataset": dataset,
+        "shuffle": True,
+        "drop_last": True
+    }
+    if batch_size is None:
+        return StatefulCycleDataLoader(
+            batch_size=1,
+            collate_fn=lambda batch: batch[0],
+            **kwargs
+        )
+    else:
+        return StatefulDataLoader(
+            batch_size=batch_size,
+            collate_fn=dataset.collate_fn,
+            **kwargs
+        )
