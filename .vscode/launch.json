@@ -1,0 +1,60 @@
+{
+    "version": "0.2.0",
+    "configurations": [
+        {
+            "name": "Debug DPO Training",
+            "type": "python",
+            "request": "launch",
+            "module": "RL2.trainer.dpo",
+            "cwd": "${workspaceFolder}",
+            "python": "/usr/bin/python",
+            "env": {
+                "RANK": "0",
+                "LOCAL_RANK": "0",
+                "WORLD_SIZE": "1",
+                "MASTER_ADDR": "localhost",
+                "MASTER_PORT": "29501"
+            },
+            "console": "integratedTerminal",
+            "justMyCode": false,
+            "args": [
+                "actor.model_name=/root/localmodels/qwen2.5-1.5b-instruct",
+                "data.path=/workspace/localdatasets/rl2-dpo-datas-from-hf-ultrafeedback_binarized/train_dpo.json",
+                "data.max_length=512",
+                "data.batch_size=1",
+                "trainer.n_epochs=1",
+                "trainer.save_freq=null",
+                "trainer.use_wandb=false",
+                "trainer.experiment_name=debug_dpo",
+                "actor.beta=0.1"
+            ]
+        },
+
+
+        {  
+            "name": "Debug PPO Training",  
+            "type": "python",  
+            "request": "launch",  
+            "program": "/workspace/RL2/RL2/trainer/ppo.py",  
+            "args": [  
+                "--config-path", "/workspace/RL2/RL2/trainer/config",  
+                "--config-name", "local_nvidia_ppo"  
+            ],  
+            "console": "integratedTerminal",  
+            "cwd": "${workspaceFolder}",  
+
+            // PyTorch分布式所需的环境变量
+            "env": {  
+                "PYTHONPATH": "${workspaceFolder}",  
+                "RANK": "0",  // 全局进程排名
+                "LOCAL_RANK": "0",   // 本地进程排名
+                "WORLD_SIZE": "1",  // 总进程数
+                "MASTER_ADDR": "localhost",   // 主节点地址
+                "MASTER_PORT": "12355"   // 主节点端口
+            },  
+
+            "justMyCode": false,  
+            "stopOnEntry": false  
+        }  
+    ]
+}

@@ -4,7 +4,7 @@ __pycache__/
 *$py.class
 rl_square.egg-info
 
-.vscode
+# .vscode
 .idea
 .pycharm
 

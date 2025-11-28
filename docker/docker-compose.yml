@@ -25,7 +25,7 @@ services:
       - /home/nvidia/Desktop/dpanel-datas/rl2datas:/workspace/rl2datas  
       - ~/Desktop/localmodels:/root/localmodels
       - ~/.cache/huggingface:/root/.cache/huggingface  
-      
+
     # 保持容器运行  
     stdin_open: true  
     tty: true  

@@ -18,6 +18,19 @@ from RL2.utils.algorithms import compute_advantages
 class PPOTrainer(Trainer):
 
     def __init__(self, config: DictConfig):
+
+        # 确保路径存在  
+        import os  
+        model_path = "/root/localmodels/qwen2.5-1.5b-instruct"  
+        assert os.path.exists(model_path), f"Model path not found: {model_path}"
+
+
+        print("Actor config:", config.actor)  
+        print("Ref Actor config:", config.ref_actor)  
+        print("Critic config:", config.critic)  
+        print("Rollout config:", config.rollout)
+
+
         super().__init__(config)
 
         self.actor = initialize_actor(config.actor, True)
@@ -95,7 +108,7 @@ class PPOTrainer(Trainer):
 @hydra.main(config_path="config", config_name="ppo", version_base=None)
 def main(config: DictConfig):
 
-    initialize_global_process_group()
+    initialize_global_process_group() # 会自动处理单卡情况
     
     trainer = PPOTrainer(config)
     asyncio.run(trainer.train())

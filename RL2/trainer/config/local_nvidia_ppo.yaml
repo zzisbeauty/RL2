@@ -1,0 +1,116 @@
+defaults:  
+- _self_
+- actor: fsdp
+- ref_actor: ${actor}
+- critic: ${actor}
+
+# 数据配置  
+train_data:  
+  path: /workspace/RL2/_study_logs/datasets/ppo_train-900.json
+  prompts_per_rollout: 8  
+  responses_per_prompt: 1  
+
+test_data:  
+  path: /workspace/RL2/_study_logs/datasets/ppo_train-100.json
+  prompts_per_rollout: 8  
+  responses_per_prompt: 1  
+  
+# Actor配置  
+actor:  
+  model_name: /root/localmodels/qwen2.5-1.5b-instruct
+  max_length: 8192  
+  max_length_per_device: 8192  
+  ddp_size: 1  # 单机设置  
+  tp_size: 1  
+  cp_size: 1  
+    
+  # PPO核心参数  
+  clip: 0.2  
+  update_per_rollout: 1  
+  avg_level: token  # Dr. GRPO风格  
+  offload_model: true  # 节省显存  
+
+  # KL散度（可选）  
+  kl:  
+    coef: 0.0  # 设为0简化训练  
+    type: null  
+    
+  # 熵正则化  
+  entropy:  
+    coef: 0.01  
+
+
+
+
+
+# Ref Actor需要完整配置  
+ref_actor:  
+  model_name: /root/localmodels/qwen2.5-1.5b-instruct  
+  max_length: 8192  
+  max_length_per_device: 8192  
+  ddp_size: 1  
+  tp_size: 1  
+  cp_size: 1  
+  # 继承所有必要的actor配置  
+
+# Critic需要完整配置  
+critic:  
+  model_name: /root/localmodels/qwen2.5-1.5b-instruct  
+  max_length: 8192  
+  max_length_per_device: 8192  
+  ddp_size: 1  
+  tp_size: 1  
+  cp_size: 1  
+  # 继承所有必要的actor配置  
+
+
+
+
+
+
+
+
+
+
+
+# Rollout配置  
+rollout:  
+  server_args:  
+    model_path: /root/localmodels/qwen2.5-1.5b-instruct
+    dtype: bfloat16  
+    tp_size: 1  
+    mem_fraction_static: 0.6  
+    
+  train_sampling_params:  
+    temperature: 1.0  
+    max_new_tokens: 512  
+    stop: null  
+    no_stop_trim: true  
+    
+  test_sampling_params:  
+    temperature: 0.0  
+    max_new_tokens: 512  
+    stop: null  
+    no_stop_trim: true  
+    
+  max_turns: 1  
+  env_path: /workspace/RL2/envs/local_nvidia_environment.py  # 环境文件路径  
+  dynamic_filtering: true  
+  
+# 优势函数配置  
+adv:  
+  estimator: reinforce  # 使用REINFORCE，无需critic  
+  gamma: 1.0  
+  lam: 0.95  
+  norm_adv: true  
+  
+# 训练器配置  
+trainer:  
+  project: rl2_ppo_demo  
+  experiment_name: ultrafeedback_qa  
+  n_epochs: 3  
+  save_freq: 10  
+  test_freq: 50  
+  load_ckpt_from: null  
+  save_dir: ckpts/${trainer.experiment_name}  
+  use_wandb: false  # 简化调试

@@ -50,7 +50,9 @@ def main(args):
         return {"passage": "\n".join(passages)}
 
     uvicorn.run(app, host="0.0.0.0", port=10000)
-    
+
+
+
 if __name__ == "__main__":
     
     parser = argparse.ArgumentParser()
